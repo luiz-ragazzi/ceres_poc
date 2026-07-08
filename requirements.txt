@@ -1,7 +1,10 @@
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-python-multipart==0.0.12
-pypdf==4.3.1
-sentence-transformers==3.0.1
-chromadb==0.5.5
-pydantic==2.8.2
+fastapi==0.136.3
+uvicorn[standard]==0.48.0
+python-multipart==0.0.29
+sentence-transformers==5.5.1
+chromadb==1.5.9
+pydantic==2.13.4
+docling==2.110.0
+docling-core==2.86.0
+transformers==5.9.0
+requests==2.34.2

@@ -57,11 +57,6 @@ class DatabaseManager:
             include=["documents", "metadatas", "distances"],
         )
     
-    def get_all_metadata(self) -> List[Dict[str, Any]]:
-        """Fetch all metadata from the collection."""
-        results = self._collection.get(include=["metadatas"])
-        return results["metadatas"]
-    
     def delete_by_doc_id(self, doc_id: str) -> int:
         """Delete all chunks belonging to a document."""
         results = self._collection.get(where={"doc_id": doc_id}, include=["metadatas"])

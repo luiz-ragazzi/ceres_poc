@@ -28,6 +28,10 @@ ENV/
 # ─── ChromaDB (local vector DB — never commit) ────────────────────────────────
 chroma_db/
 
+# ─── Document store: original PDFs, converted Markdown, registry.db (regulated
+# content — never commit) ──────────────────────────────────────────────────────
+documents/
+
 # ─── sentence-transformers model cache ───────────────────────────────────────
 .cache/
 models/
@@ -65,6 +69,7 @@ desktop.ini
 # ─── IDEs ────────────────────────────────────────────────────────────────────
 .vscode/
 .idea/
+.claude/
 *.sublime-project
 *.sublime-workspace
 *.swp
