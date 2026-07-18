@@ -1,11 +1,18 @@
 """
 Document processing pipeline: save original PDF, convert to Markdown via
-Docling, chunk along the heading tree, and embed the chunks.
+Docling, chunk by regulatory structure (Part/Subpart/Section/Paragraph),
+and embed the chunks.
 
 PDFs are kept on disk as the system of record (exact pagination/formatting
 for audit purposes). Markdown is a derived, human-inspectable intermediate
-that gives the chunker a real heading hierarchy instead of guessing
-structure from font size in raw PDF text.
+that gives the regulatory parser a real heading hierarchy instead of
+guessing structure from font size in raw PDF text.
+
+Docling's HybridChunker is still used, but only as a page-number locator:
+it walks the parsed document tree with page provenance attached, which we
+use to look up which PDF page(s) a given heading's content came from. The
+actual chunk boundaries — one chunk per regulatory obligation — come from
+regulatory_parser.create_regulatory_chunks(), not from HybridChunker.
 """
 
 import hashlib
@@ -17,8 +24,10 @@ from docling.document_converter import DocumentConverter
 from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
 from transformers import AutoTokenizer
 
-from config import DOCUMENTS_PATH, EMBED_MODEL, MAX_CHUNK_TOKENS
+from config import AUTHORITY_PATTERNS, DOCUMENTS_PATH, EMBED_MODEL, MAX_CHUNK_TOKENS
 from embedder import get_embedder
+from regulatory_metadata import UNKNOWN
+from regulatory_parser import DocumentContext, RegulatoryChunk, create_regulatory_chunks, detect_authority
 
 _converter = DocumentConverter()
 
@@ -28,9 +37,8 @@ _tokenizer = HuggingFaceTokenizer(
 )
 _chunker = HybridChunker(
     tokenizer=_tokenizer,
-    # Keep chunks aligned 1:1 with a single heading section — for audit
-    # citations, precise section attribution matters more than avoiding a
-    # few small chunks.
+    # Keep chunks aligned 1:1 with a single heading section — needed for
+    # the page-number lookup in _build_heading_page_map to stay precise.
     merge_peers=False,
 )
 
@@ -62,44 +70,77 @@ def convert_to_markdown(doc_id: str, pdf_path: str) -> Tuple[Any, str, str]:
     return document, markdown_text, md_path
 
 
-def chunk_document(document: Any) -> List[Dict[str, Any]]:
+def _build_heading_page_map(document: Any) -> Dict[str, List[int]]:
     """
-    Heading-aware chunking via Docling's HybridChunker: it walks the parsed
-    document tree, groups content under its heading hierarchy, keeps tables
-    intact, and token-bounds each chunk to the embedding model's context
-    window (merging small sibling sections, splitting oversized ones).
+    Best-effort page lookup per heading: run Docling's HybridChunker once
+    purely to get page provenance, then key it by the heading text itself
+    so regulatory_parser's section titles (parsed independently from the
+    same markdown) can look up which PDF page(s) they came from.
     """
-    chunks = []
+    page_map: Dict[str, List[int]] = {}
     for raw_chunk in _chunker.chunk(dl_doc=document):
-        pages = sorted({
-            prov.page_no
-            for item in raw_chunk.meta.doc_items
-            for prov in item.prov
-        })
-        chunks.append({
-            "text": raw_chunk.text,
-            # heading path prefixed in — improves retrieval relevance
-            "embed_text": _chunker.contextualize(chunk=raw_chunk),
-            "section_path": " > ".join(raw_chunk.meta.headings or []),
-            "pages": pages,
-        })
-    return chunks
+        headings = raw_chunk.meta.headings or []
+        if not headings:
+            continue
+        pages = {prov.page_no for item in raw_chunk.meta.doc_items for prov in item.prov}
+        key = headings[-1].strip().lower()
+        existing = page_map.setdefault(key, set())
+        existing.update(pages)
+    return {k: sorted(v) for k, v in page_map.items()}
 
 
-def embed_chunks(chunks: List[Dict[str, Any]]) -> List[List[float]]:
+def detect_document_authority(markdown_text: str, filename: str) -> Tuple[str, str]:
+    """Auto-detect (authority, country) from document title/text/filename."""
+    authority, country = detect_authority(markdown_text[:2000], AUTHORITY_PATTERNS)
+    if authority == UNKNOWN:
+        authority, country = detect_authority(filename, AUTHORITY_PATTERNS)
+    return authority, country
+
+
+def pages_for_chunk(chunk: RegulatoryChunk, page_map: Dict[str, List[int]]) -> List[int]:
+    """Best-effort PDF page(s) for a chunk, via its section heading title."""
+    return page_map.get(chunk.heading_title.strip().lower(), [])
+
+
+def embed_chunks(chunks: List[RegulatoryChunk]) -> List[List[float]]:
     embedder = get_embedder()
-    return embedder.encode([c["embed_text"] for c in chunks])
+    return embedder.encode([c.embed_text for c in chunks])
 
 
-def process_pdf(doc_id: str, file_bytes: bytes) -> Tuple[str, List[Dict[str, Any]], List[List[float]], str, str, int]:
+def chunk_and_embed(
+    document: Any,
+    markdown_text: str,
+    context: DocumentContext,
+) -> Tuple[List[RegulatoryChunk], List[List[float]], Dict[str, List[int]]]:
+    """
+    Regulatory-structure chunk an already-converted document and embed the
+    result. Split out from process_pdf() so callers that need to inspect
+    the Markdown (e.g. to auto-detect `authority` before finalizing the
+    DocumentContext) can convert once and chunk afterward instead of
+    converting the PDF twice.
+    """
+    page_map = _build_heading_page_map(document)
+    chunks = create_regulatory_chunks(markdown_text, context)
+    embeddings = embed_chunks(chunks)
+    return chunks, embeddings, page_map
+
+
+def process_pdf(
+    doc_id: str,
+    file_bytes: bytes,
+    context: DocumentContext,
+) -> Tuple[str, List[RegulatoryChunk], List[List[float]], str, str, int, Dict[str, List[int]]]:
     """
     Full pipeline: save original -> Docling convert to Markdown ->
-    heading-aware chunk -> embed.
+    regulatory structure chunk -> embed. Use this when the DocumentContext
+    (authority, regulation, ...) is already fully known; otherwise convert
+    first and call chunk_and_embed() once authority has been auto-detected.
 
-    Returns (markdown_text, chunks, embeddings, pdf_path, md_path, page_count).
+    Returns (markdown_text, chunks, embeddings, pdf_path, md_path,
+    page_count, heading_page_map). heading_page_map lets the caller look up
+    approximate PDF page(s) per chunk via its section heading title.
     """
     pdf_path = save_original_pdf(doc_id, file_bytes)
     document, markdown_text, md_path = convert_to_markdown(doc_id, pdf_path)
-    chunks = chunk_document(document)
-    embeddings = embed_chunks(chunks)
-    return markdown_text, chunks, embeddings, pdf_path, md_path, document.num_pages()
+    chunks, embeddings, page_map = chunk_and_embed(document, markdown_text, context)
+    return markdown_text, chunks, embeddings, pdf_path, md_path, document.num_pages(), page_map

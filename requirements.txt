@@ -8,3 +8,4 @@ docling==2.110.0
 docling-core==2.86.0
 transformers==5.9.0
 requests==2.34.2
+pytest==8.3.4

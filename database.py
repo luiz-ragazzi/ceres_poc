@@ -4,7 +4,7 @@ ChromaDB client and database operations.
 
 import chromadb
 from chromadb.config import Settings
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from config import CHROMA_PATH, COLLECTION_NAME
 
 
@@ -49,13 +49,21 @@ class DatabaseManager:
         self,
         query_embeddings: List[List[float]],
         n_results: int,
+        where: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Query the collection with embeddings."""
-        return self._collection.query(
-            query_embeddings=query_embeddings,
-            n_results=n_results,
-            include=["documents", "metadatas", "distances"],
-        )
+        """
+        Query the collection with embeddings, optionally narrowed by a
+        compliance metadata filter, e.g. where={"authority": "FDA"} or
+        where={"authority": "FDA", "chunk_type": "regulatory_requirement"}.
+        """
+        kwargs: Dict[str, Any] = {
+            "query_embeddings": query_embeddings,
+            "n_results": n_results,
+            "include": ["documents", "metadatas", "distances"],
+        }
+        if where:
+            kwargs["where"] = where if len(where) == 1 else {"$and": [{k: v} for k, v in where.items()]}
+        return self._collection.query(**kwargs)
     
     def delete_by_doc_id(self, doc_id: str) -> int:
         """Delete all chunks belonging to a document."""

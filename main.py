@@ -1,7 +1,9 @@
 """
 Compliance Document RAG POC - FastAPI Backend
-Uploads PDFs, converts them to Markdown via Docling for heading-aware
-chunking, embeds chunks with sentence-transformers, and stores them in a
+Uploads PDFs, converts them to Markdown via Docling, chunks them by
+regulatory structure (Part/Subpart/Section/Paragraph — see
+regulatory_parser.py), embeds chunks with sentence-transformers, and
+stores them with full compliance metadata (regulatory_metadata.py) in a
 local ChromaDB vector database. Original PDFs and converted Markdown are
 kept on disk as the audit-trail system of record, independent of Chroma.
 """
@@ -9,18 +11,27 @@ kept on disk as the audit-trail system of record, independent of Chroma.
 import os
 import uuid
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 
 import registry
-from config import CORS_ORIGINS, DOCUMENTS_PATH, DOC_TYPES
+from config import CORS_ORIGINS, DOCUMENTS_PATH, DOC_TYPES, DOC_TYPE_METADATA
 from embedder import get_embedder
 from database import get_database
 from ollama_client import generate_answer, OllamaUnavailableError
-from pdf_processor import process_pdf, sha256_of
+from pdf_processor import (
+    chunk_and_embed,
+    convert_to_markdown,
+    detect_document_authority,
+    pages_for_chunk,
+    save_original_pdf,
+    sha256_of,
+)
+from regulatory_metadata import UNKNOWN
+from regulatory_parser import DocumentContext, regulation_slug
 from models import AskResponse, QueryRequest, QueryResult, DocumentInfo
 
 # ─── App Setup ───────────────────────────────────────────────────────────────
@@ -60,10 +71,27 @@ def doc_types():
 
 
 @app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...), doc_type: str = Form("Other")):
+async def upload_pdf(
+    file: UploadFile = File(...),
+    doc_type: str = Form("Other"),
+    authority: Optional[str] = Form(None),
+    regulation: Optional[str] = Form(None),
+    regulation_family: Optional[str] = Form(None),
+    title: Optional[str] = Form(None),
+    effective_date: Optional[str] = Form(None),
+    version: Optional[str] = Form(None),
+    status: Optional[str] = Form(None),
+    source_url: Optional[str] = Form(None),
+):
     """
     Upload a PDF -> save original -> convert to Markdown via Docling ->
-    heading-aware chunk -> embed -> store in ChromaDB.
+    regulatory structure chunk (Part/Subpart/Section/Paragraph) -> embed ->
+    store in ChromaDB with full compliance metadata.
+
+    authority/regulation/etc. are optional: authority and its country are
+    auto-detected from the document text when not supplied explicitly.
+    Every other unresolved field is stored as "unknown" rather than
+    omitted, per the mandatory metadata schema (regulatory_metadata.py).
     """
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
@@ -78,10 +106,42 @@ async def upload_pdf(file: UploadFile = File(...), doc_type: str = Form("Other")
     doc_id = str(uuid.uuid4())
     uploaded_at = datetime.utcnow().isoformat()
 
+    document_type, chunk_type = DOC_TYPE_METADATA[doc_type]
+
     try:
-        markdown_text, chunks, embeddings, pdf_path, md_path, page_count = process_pdf(
-            doc_id, contents
+        # Authority auto-detection needs the converted Markdown, so convert
+        # first and build the DocumentContext once we know it, rather than
+        # guessing up front.
+        pdf_path = save_original_pdf(doc_id, contents)
+        document, markdown_text, md_path = convert_to_markdown(doc_id, pdf_path)
+
+        detected_authority, detected_country = detect_document_authority(markdown_text, file.filename)
+        resolved_authority = authority or detected_authority
+        resolved_regulation = regulation or UNKNOWN
+        reg_slug = regulation_slug(resolved_regulation)
+        document_id = (
+            f"{resolved_authority}_{reg_slug}"
+            if resolved_authority != UNKNOWN and reg_slug != UNKNOWN
+            else doc_id
         )
+
+        context = DocumentContext(
+            document_id=document_id,
+            authority=resolved_authority,
+            country=detected_country if not authority else UNKNOWN,
+            document_type=document_type,
+            regulation_family=regulation_family or UNKNOWN,
+            regulation=resolved_regulation,
+            title=title or UNKNOWN,
+            chunk_type=chunk_type,
+            effective_date=effective_date or UNKNOWN,
+            version=version or UNKNOWN,
+            status=status or UNKNOWN,
+            source_url=source_url or UNKNOWN,
+        )
+
+        chunks, embeddings, page_map = chunk_and_embed(document, markdown_text, context)
+        page_count = document.num_pages()
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Could not process PDF: {e}")
 
@@ -94,24 +154,28 @@ async def upload_pdf(file: UploadFile = File(...), doc_type: str = Form("Other")
     if not chunks:
         raise HTTPException(status_code=422, detail="Chunking produced no results.")
 
-    ids = [f"{doc_id}_{i}" for i in range(len(chunks))]
-    metadatas = [
-        {
-            "doc_id": doc_id,
-            "filename": file.filename,
-            "doc_type": doc_type,
-            "chunk_index": i,
-            "section_path": c["section_path"],
-            "pages": ",".join(str(p) for p in c["pages"]),
-            "uploaded_at": uploaded_at,
-        }
-        for i, c in enumerate(chunks)
-    ]
+    ids = [f"{doc_id}_{i}_{c.metadata.chunk_id}" for i, c in enumerate(chunks)]
+    metadatas = []
+    for i, c in enumerate(chunks):
+        meta = c.metadata.to_chroma_metadata()
+        pages = pages_for_chunk(c, page_map)
+        meta.update(
+            {
+                "doc_id": doc_id,
+                "filename": file.filename,
+                "doc_type": doc_type,
+                "chunk_index": i,
+                "section_path": meta["citation_path"] if meta["citation_path"] != UNKNOWN else (c.heading_title or UNKNOWN),
+                "pages": ",".join(str(p) for p in pages),
+                "uploaded_at": uploaded_at,
+            }
+        )
+        metadatas.append(meta)
 
     db.add_documents(
         ids=ids,
         embeddings=embeddings,
-        documents=[c["text"] for c in chunks],
+        documents=[c.text for c in chunks],
         metadatas=metadatas,
     )
 
@@ -129,16 +193,23 @@ async def upload_pdf(file: UploadFile = File(...), doc_type: str = Form("Other")
 
     return {
         "doc_id": doc_id,
+        "document_id": document_id,
         "filename": file.filename,
         "doc_type": doc_type,
+        "authority": resolved_authority,
         "chunk_count": len(chunks),
         "page_count": page_count,
         "uploaded_at": uploaded_at,
     }
 
 
-def _retrieve(query_text: str, top_k: int) -> List[QueryResult]:
-    """Embed the query and return top-k similar chunks with citation metadata."""
+def _retrieve(query_text: str, top_k: int, filters: Optional[dict] = None) -> List[QueryResult]:
+    """
+    Embed the query and return top-k similar chunks with full citation
+    metadata, optionally narrowed by a compliance filter (e.g.
+    {"authority": "FDA"} or {"authority": "FDA", "chunk_type":
+    "regulatory_requirement"}), enabling compliance-scoped retrieval.
+    """
     if not query_text.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
 
@@ -150,6 +221,7 @@ def _retrieve(query_text: str, top_k: int) -> List[QueryResult]:
     results = db.query(
         query_embeddings=query_embedding,
         n_results=min(top_k, db.count()),
+        where=filters,
     )
 
     output = []
@@ -167,6 +239,18 @@ def _retrieve(query_text: str, top_k: int) -> List[QueryResult]:
                 section_path=meta.get("section_path", ""),
                 pages=meta.get("pages", ""),
                 doc_type=meta.get("doc_type", ""),
+                chunk_id=meta.get("chunk_id", "unknown"),
+                authority=meta.get("authority", "unknown"),
+                regulation=meta.get("regulation", "unknown"),
+                part=meta.get("part", "unknown"),
+                subpart=meta.get("subpart", "unknown"),
+                section=meta.get("section", "unknown"),
+                paragraph=meta.get("paragraph", "unknown"),
+                topic=meta.get("topic", "unknown"),
+                gxp_area=meta.get("gxp_area", "unknown"),
+                compliance_domain=meta.get("compliance_domain", "unknown"),
+                chunk_type=meta.get("chunk_type", "unknown"),
+                citation_path=meta.get("citation_path", "unknown"),
             )
         )
 
@@ -176,9 +260,10 @@ def _retrieve(query_text: str, top_k: int) -> List[QueryResult]:
 @app.post("/query", response_model=List[QueryResult])
 def query(req: QueryRequest):
     """
-    Semantic search: embed the query and return top-k similar chunks.
+    Semantic search: embed the query and return top-k similar chunks,
+    optionally scoped by compliance metadata filters (req.filters).
     """
-    return _retrieve(req.query, req.top_k)
+    return _retrieve(req.query, req.top_k, req.filters)
 
 
 @app.post("/ask", response_model=AskResponse)
@@ -187,7 +272,7 @@ def ask(req: QueryRequest):
     Retrieval-augmented answer: retrieve top-k chunks, then have a local
     Ollama model synthesize a grounded answer, citing chunk sources.
     """
-    chunks = _retrieve(req.query, req.top_k)
+    chunks = _retrieve(req.query, req.top_k, req.filters)
 
     try:
         answer = generate_answer(req.query, chunks)
